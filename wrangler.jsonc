@@ -1,0 +1,15 @@
+{
+  // Settings for the NotSoTylerr Design cosmetics server.
+  // Put this file next to worker.js in the top folder of your GitHub repo.
+  "name": "nst-cosmetics",
+  "main": "worker.js",
+  "compatibility_date": "2026-10-01",
+  "kv_namespaces": [
+    {
+      "binding": "NST",
+      // Replace this with your KV namespace ID:
+      // Cloudflare dashboard -> Storage & Databases -> KV -> nst-cosmetics -> copy the ID
+      "id": "81b63a73c2b84252b71dc8999272522e"
+    }
+  ]
+}
