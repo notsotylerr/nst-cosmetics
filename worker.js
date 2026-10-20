@@ -25,6 +25,13 @@ const TRAILS = ["NONE", "SPARKLE", "FLAME", "HEARTS", "NOTES", "RAINBOW", "PIXEL
 const NAMES = ["OFF", "SOLID", "GRADIENT", "RAINBOW", "WAVE", "PULSE"];
 const PETS = ["NONE", "GHOST", "DRAGON", "SLIME", "BAT", "FAIRY"];
 const PING_GAP = 60; // seconds between pings to the same friend
+// Mojang turns away requests that don't say who they are, and Workers don't send a User-Agent on their own.
+const MOJANG_HEADERS = { "user-agent": "NotSoTylerr-Design-Cosmetics/1.0 (+https://github.com/notsotylerr/nst-cosmetics)", accept: "application/json" };
+
+function hasJoined(name, serverId) {
+  return fetch("https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" +
+    encodeURIComponent(name) + "&serverId=" + encodeURIComponent(serverId), { headers: MOJANG_HEADERS });
+}
 
 function json(data, status = 200, extra = {}) {
   return new Response(JSON.stringify(data), { status, headers: { "content-type": "application/json", ...extra } });
@@ -112,6 +119,12 @@ export default {
     try {
       if (path === "/" || path === "") return json({ ok: true, service: "NotSoTylerr Design cosmetics" });
 
+      // Can this server talk to Mojang? 204 means yes (that made-up code was never joined).
+      if (path === "/v1/check/mojang") {
+        const r = await hasJoined("Notch", "0".repeat(20));
+        return json({ mojangStatus: r.status, ok: r.status === 204 || r.status === 200 });
+      }
+
       // 1) one-time code for the Mojang check
       if (path === "/v1/auth/start" && req.method === "POST") {
         const b = await readJson(req, 500);
@@ -128,9 +141,11 @@ export default {
         const pending = await env.NST.get("n:" + b.serverId, "json");
         if (!pending) return json({ error: "code expired" }, 403);
         await env.NST.delete("n:" + b.serverId);
-        const r = await fetch("https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" +
-          encodeURIComponent(pending.name) + "&serverId=" + encodeURIComponent(b.serverId));
-        if (r.status !== 200) return json({ error: "Mojang couldn't confirm you" }, 403);
+        const r = await hasJoined(pending.name, b.serverId);
+        if (r.status !== 200) {
+          console.log("hasJoined failed", pending.name, r.status, (await r.text()).slice(0, 300));
+          return json({ error: "Mojang couldn't confirm you", mojangStatus: r.status }, 403);
+        }
         const profile = await r.json();
         if (!profile || profile.id !== pending.uuid) return json({ error: "wrong player" }, 403);
         const token = randomHex(32);
