@@ -225,17 +225,65 @@ async function migrate(env, id) {
 const b64 = (s) => Uint8Array.from(atob(s.replace(/\s+/g, "")), (c) => c.charCodeAt(0));
 let mojangKeys = null, mojangKeysAt = 0;
 
-// Mojang's public keys for player certificates (cached for an hour)
-async function getMojangKeys() {
-  if (mojangKeys && Date.now() - mojangKeysAt < 3600_000) return mojangKeys;
-  const r = await fetch("https://api.minecraftservices.com/publickeys");
-  if (r.status !== 200) throw new Error("couldn't get Mojang's keys");
-  const j = await r.json();
-  mojangKeys = await Promise.all((j.playerCertificateKeys || []).map((k) =>
-    crypto.subtle.importKey("spki", b64(k.publicKey), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-1" }, false, ["verify"])));
-  mojangKeysAt = Date.now();
-  return mojangKeys;
+// Requests to Mojang. Some of Mojang's services refuse requests with no User-Agent (a Worker sends none by
+// default), and they sometimes have a hiccup, so: proper headers, a timeout and a couple of retries.
+const MOJANG_HEADERS = { "User-Agent": "NotSoTylerr-Design-Cosmetics/2 (Cloudflare Worker)", Accept: "application/json" };
+async function mojangFetch(url, tries = 3) {
+  let last = null;
+  for (let i = 0; i < tries; i++) {
+    try {
+      const r = await fetch(url, { headers: MOJANG_HEADERS, signal: AbortSignal.timeout(6000) });
+      if (r.status === 200 || r.status === 204 || r.status === 404) return r;
+      last = r;
+      if (r.status !== 429 && r.status < 500 && r.status !== 403) return r;
+    } catch (e) {
+      last = null;
+    }
+    if (i < tries - 1) await new Promise((res) => setTimeout(res, 300 * (i + 1)));
+  }
+  return last || new Response(null, { status: 599 });
 }
+
+const importMojangKeys = (list) => Promise.all(list.map((k) =>
+  crypto.subtle.importKey("spki", b64(k), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-1" }, false, ["verify"])));
+
+// Mojang's public keys for player certificates. Cached in memory for an hour and saved in the database,
+// so a hiccup at Mojang doesn't stop people logging in (these keys almost never change).
+async function getMojangKeys(db) {
+  if (mojangKeys && Date.now() - mojangKeysAt < 3600_000) return mojangKeys;
+  let why = "";
+  try {
+    const r = await mojangFetch("https://api.minecraftservices.com/publickeys");
+    if (r.status === 200) {
+      const j = await r.json();
+      const list = (j.playerCertificateKeys || []).map((k) => k && k.publicKey).filter((k) => typeof k === "string");
+      if (list.length) {
+        mojangKeys = await importMojangKeys(list);
+        mojangKeysAt = Date.now();
+        if (db) try { await run(db, "INSERT INTO meta (k, v) VALUES ('mojangKeys', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", JSON.stringify(list)); } catch (e) {}
+        return mojangKeys;
+      }
+      why = "no keys in the reply";
+    } else why = "HTTP " + r.status;
+  } catch (e) {
+    why = String(e && e.message || e).slice(0, 80);
+  }
+  // Mojang didn't answer: use the copy we saved last time
+  if (db) {
+    try {
+      const saved = await one(db, "SELECT v FROM meta WHERE k = 'mojangKeys'");
+      if (saved && saved.v) {
+        mojangKeys = await importMojangKeys(JSON.parse(saved.v));
+        mojangKeysAt = Date.now() - 3000_000; // try Mojang again in 10 minutes
+        return mojangKeys;
+      }
+    } catch (e) {}
+  }
+  if (mojangKeys) return mojangKeys; // an old copy is better than nothing
+  throw new MojangDown("couldn't get Mojang's keys (" + why + ")");
+}
+
+class MojangDown extends Error {}
 
 async function issueToken(env, id, name) {
   const token = randomHex(32);
@@ -246,7 +294,7 @@ async function issueToken(env, id, name) {
 
 // Mojang name -> id (for "add friend by name")
 async function idForName(name) {
-  const r = await fetch("https://api.mojang.com/users/profiles/minecraft/" + encodeURIComponent(name));
+  const r = await mojangFetch("https://api.mojang.com/users/profiles/minecraft/" + encodeURIComponent(name));
   if (r.status !== 200) return null;
   const p = await r.json();
   return p && isId(p.id) ? { id: p.id, name: p.name } : null;
@@ -588,9 +636,10 @@ async function handle(req, env, url) {
     if (typeof b.serverId !== "string" || !/^[0-9a-f]{20}$/.test(b.serverId)) return json({ error: "bad code" }, 400);
     const pending = await takePending(b.serverId);
     if (!pending) return json({ error: "code expired" }, 403);
-    const r = await fetch("https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" +
+    const r = await mojangFetch("https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" +
       encodeURIComponent(pending.name) + "&serverId=" + encodeURIComponent(b.serverId));
-    if (r.status !== 200) return json({ error: "Mojang couldn't confirm you" }, 403);
+    if (r.status === 204 || r.status === 403 || r.status === 404) return json({ error: "Mojang couldn't confirm you" }, 403);
+    if (r.status !== 200) return json({ error: "Mojang didn't answer (HTTP " + r.status + "), try again in a minute", why: "mojangdown" }, 503);
     const profile = await r.json();
     if (!profile || profile.id !== pending.uuid) return json({ error: "wrong player" }, 403);
     return json({ token: await issueToken(env, profile.id, profile.name), name: profile.name });
@@ -615,7 +664,16 @@ async function handle(req, env, url) {
     data.set(pub, 24);
     const keySig = b64(b.keySignature);
     let mojangOk = false;
-    for (const k of await getMojangKeys()) {
+    let keys;
+    try {
+      keys = await getMojangKeys(db);
+    } catch (e) {
+      if (!(e instanceof MojangDown)) throw e;
+      // put the code back so the game can try the other login (the "join a server" check) with it
+      await run(db, "INSERT OR REPLACE INTO pending (sid, uuid, name, exp) VALUES (?, ?, ?, ?)", b.serverId, pending.uuid, pending.name, Date.now() + 120_000);
+      return json({ error: e.message, why: "mojangkeys" }, 503);
+    }
+    for (const k of keys) {
       if (await crypto.subtle.verify("RSASSA-PKCS1-v1_5", k, keySig, data)) { mojangOk = true; break; }
     }
     if (!mojangOk) return json({ error: "Mojang didn't sign that key" }, 403);
@@ -624,7 +682,7 @@ async function handle(req, env, url) {
     if (!(await crypto.subtle.verify("RSASSA-PKCS1-v1_5", playerKey, b64(b.signature), msg))) return json({ error: "bad signature" }, 403);
     // the real name for that account (so nobody can pick someone else's name)
     let name = pending.name;
-    const pr = await fetch("https://sessionserver.mojang.com/session/minecraft/profile/" + pending.uuid);
+    const pr = await mojangFetch("https://sessionserver.mojang.com/session/minecraft/profile/" + pending.uuid, 1);
     if (pr.status === 200) { const prof = await pr.json(); if (prof && isName(prof.name)) name = prof.name; }
     return json({ token: await issueToken(env, pending.uuid, name), name });
   }
