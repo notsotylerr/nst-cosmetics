@@ -247,40 +247,45 @@ async function mojangFetch(url, tries = 3) {
 const importMojangKeys = (list) => Promise.all(list.map((k) =>
   crypto.subtle.importKey("spki", b64(k), { name: "RSASSA-PKCS1-v1_5", hash: "SHA-1" }, false, ["verify"])));
 
-// Mojang's public keys for player certificates. Cached in memory for an hour and saved in the database,
-// so a hiccup at Mojang doesn't stop people logging in (these keys almost never change).
+// Mojang's public keys for player certificates (from https://api.minecraftservices.com/publickeys, checked 2026-10-21).
+// Mojang refuses every request that comes from a Cloudflare Worker (403), so the worker can't download these itself:
+// they're built in here. They almost never change; if Mojang ever adds a new one, the worker also tries to fetch
+// the live list now and then (in case Mojang unblocks Workers) and keeps any extra keys it gets in the database.
+const PINNED_MOJANG_KEYS = [
+  "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAylB4B6m5lz7jwrcFz6Fd/fnfUhcvlxsTSn5kIK/2aGG1C3kMy4VjhwlxF6BFUSnfxhNswPjh3ZitkBxEAFY25uzkJFRwHwVA9mdwjashXILtR6OqdLXXFVyUPIURLOSWqGNBtb08EN5fMnG8iFLgEJIBMxs9BvF3s3/FhuHyPKiVTZmXY0WY4ZyYqvoKR+XjaTRPPvBsDa4WI2u1zxXMeHlodT3lnCzVvyOYBLXL6CJgByuOxccJ8hnXfF9yY4F0aeL080Jz/3+EBNG8RO4ByhtBf4Ny8NQ6stWsjfeUIvH7bU/4zCYcYOq4WrInXHqS8qruDmIl7P5XXGcabuzQstPf/h2CRAUpP/PlHXcMlvewjmGU6MfDK+lifScNYwjPxRo4nKTGFZf/0aqHCh/EAsQyLKrOIYRE0lDG3bzBh8ogIMLAugsAfBb6M3mqCqKaTMAf/VAjh5FFJnjS+7bE+bZEV0qwax1CEoPPJL1fIQjOS8zj086gjpGRCtSy9+bTPTfTR/SJ+VUB5G2IeCItkNHpJX2ygojFZ9n5Fnj7R9ZnOM+L8nyIjPu3aePvtcrXlyLhH/hvOfIOjPxOlqW+O5QwSFP4OEcyLAUgDdUgyW36Z5mB285uKW/ighzZsOTevVUG2QwDItObIV6i8RCxFbN2oDHyPaO5j1tTaBNyVt8CAwEAAQ==",
+  "MIICIjANBgkqhkiG9w0BAQEFAAOCAg8AMIICCgKCAgEAt4t9NPuu7cktclnaH7eZj0omkLcJHeLz5MKsyJEntHZ0INtuBjSSul3Pp3pBeJN8k3ADdcdBLUN90bcAi7WsQqTx3Ft363q3W7TbM8j2iTEdp/0uVspoRt/DP1tkaWFs/w2WwUv9jbVoBUzfUc4pSTIxRwdjmqjZQfvjwKNDbOx3IhP2H0WXodbISejPi1wBZqNW4m1rnZAXp/EpUguxA8mobCa4vUCBkyFDyXdl69/wUSJHyCPmgcMJ364OlAhIqtwVPShBZObvrK/f0BYk6ShJD3N7TFDatSYsIIdcTKRknaIm91s+EsMrdB9U4Yw+ZJ/pyCB4S3vk8zfDCnb0DWIxYH3/EMzaxl77djmTmMzi/JDITup5z3jfWtRZmrAhU2/+W5IO5hEpo3/bCS9PXIY5xb41Lmp2ZO8dXKtyD66Chchy0W129n8vPl2GIruOdrxsjZAHnneyAb9jm0uaGaphwnEnuecX/qgHY6ZMtayvLLsPst8PO6R1vufMy8WqjK+j7LnC1krL7CPDg0NEhyQTmw5l+NCNjSlvB1juM9V4PARg0bYCOkGXm7ydRCjSSH8CJXZpwnd5cBB5WKAX3KPzutRgMi/LFwNSMZzFuUyXaYOZPpD259yqph1LmGqegEdDriACVU+dVEONFMm8eIuBofe7ljmsAFKW9BINwK0CAwEAAQ==",
+];
+let mojangTried = 0;
+
 async function getMojangKeys(db) {
   if (mojangKeys && Date.now() - mojangKeysAt < 3600_000) return mojangKeys;
-  let why = "";
-  try {
-    const r = await mojangFetch("https://api.minecraftservices.com/publickeys");
-    if (r.status === 200) {
-      const j = await r.json();
-      const list = (j.playerCertificateKeys || []).map((k) => k && k.publicKey).filter((k) => typeof k === "string");
-      if (list.length) {
-        mojangKeys = await importMojangKeys(list);
-        mojangKeysAt = Date.now();
-        if (db) try { await run(db, "INSERT INTO meta (k, v) VALUES ('mojangKeys', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", JSON.stringify(list)); } catch (e) {}
-        return mojangKeys;
-      }
-      why = "no keys in the reply";
-    } else why = "HTTP " + r.status;
-  } catch (e) {
-    why = String(e && e.message || e).slice(0, 80);
-  }
-  // Mojang didn't answer: use the copy we saved last time
+  const list = new Set(PINNED_MOJANG_KEYS);
   if (db) {
     try {
       const saved = await one(db, "SELECT v FROM meta WHERE k = 'mojangKeys'");
-      if (saved && saved.v) {
-        mojangKeys = await importMojangKeys(JSON.parse(saved.v));
-        mojangKeysAt = Date.now() - 3000_000; // try Mojang again in 10 minutes
-        return mojangKeys;
+      if (saved && saved.v) for (const k of JSON.parse(saved.v)) if (typeof k === "string") list.add(k);
+    } catch (e) {}
+  }
+  if (Date.now() - mojangTried > 6 * 3600_000) { // a quick, one-shot look at the live list (usually refused)
+    mojangTried = Date.now();
+    try {
+      const r = await mojangFetch("https://api.minecraftservices.com/publickeys", 1);
+      if (r.status === 200) {
+        const live = ((await r.json()).playerCertificateKeys || []).map((k) => k && k.publicKey).filter((k) => typeof k === "string");
+        const extra = live.filter((k) => !list.has(k));
+        for (const k of live) list.add(k);
+        if (db && extra.length) try { await run(db, "INSERT INTO meta (k, v) VALUES ('mojangKeys', ?1) ON CONFLICT(k) DO UPDATE SET v = ?1", JSON.stringify(live)); } catch (e) {}
       }
     } catch (e) {}
   }
-  if (mojangKeys) return mojangKeys; // an old copy is better than nothing
-  throw new MojangDown("couldn't get Mojang's keys (" + why + ")");
+  const keys = [];
+  for (const k of list) {
+    try { keys.push((await importMojangKeys([k]))[0]); } catch (e) {}
+  }
+  if (!keys.length) throw new MojangDown("couldn't load Mojang's keys");
+  mojangKeys = keys;
+  mojangKeysAt = Date.now();
+  return mojangKeys;
 }
 
 class MojangDown extends Error {}
@@ -294,7 +299,7 @@ async function issueToken(env, id, name) {
 
 // Mojang name -> id (for "add friend by name")
 async function idForName(name) {
-  const r = await mojangFetch("https://api.mojang.com/users/profiles/minecraft/" + encodeURIComponent(name));
+  const r = await mojangFetch("https://api.mojang.com/users/profiles/minecraft/" + encodeURIComponent(name), 1);
   if (r.status !== 200) return null;
   const p = await r.json();
   return p && isId(p.id) ? { id: p.id, name: p.name } : null;
@@ -637,7 +642,7 @@ async function handle(req, env, url) {
     const pending = await takePending(b.serverId);
     if (!pending) return json({ error: "code expired" }, 403);
     const r = await mojangFetch("https://sessionserver.mojang.com/session/minecraft/hasJoined?username=" +
-      encodeURIComponent(pending.name) + "&serverId=" + encodeURIComponent(b.serverId));
+      encodeURIComponent(pending.name) + "&serverId=" + encodeURIComponent(b.serverId), 1);
     if (r.status === 204 || r.status === 403 || r.status === 404) return json({ error: "Mojang couldn't confirm you" }, 403);
     if (r.status !== 200) return json({ error: "Mojang didn't answer (HTTP " + r.status + "), try again in a minute", why: "mojangdown" }, 503);
     const profile = await r.json();
